@@ -1,0 +1,227 @@
+const SHEET_NAME = "Tarjetas";
+const HEADERS = ["ID", "Titulo", "Descripcion", "Responsable", "FechaInicio", "FechaFin", "URL", "Estado", "FechaCreacion"];
+const STATUS_REVIEW = "En revisión";
+
+/* ------------------------------------------------------------
+ * Utilidades de hoja
+ * ---------------------------------------------------------- */
+function getSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET_NAME);
+    sheet.appendRow(HEADERS);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function rowToCard_(row) {
+  return {
+    id: row[0],
+    titulo: row[1],
+    descripcion: row[2],
+    responsable: row[3],
+    fechaInicio: row[4] ? formatDate_(row[4]) : "",
+    fechaFin: row[5] ? formatDate_(row[5]) : "",
+    url: row[6],
+    estado: row[7],
+    fechaCreacion: row[8] ? formatDate_(row[8]) : "",
+  };
+}
+
+function formatDate_(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    return Utilities.formatDate(value, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  }
+  return value;
+}
+
+function findRowIndexById_(sheet, id) {
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(id)) return i + 1; // 1-based row number
+  }
+  return -1;
+}
+
+/* ------------------------------------------------------------
+ * Respuestas JSON
+ * ---------------------------------------------------------- */
+function jsonResponse_(payload) {
+  return ContentService.createTextOutput(JSON.stringify(payload))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function ok_(data) {
+  return jsonResponse_({ ok: true, data: data });
+}
+
+function fail_(message) {
+  return jsonResponse_({ ok: false, error: message });
+}
+
+/* ------------------------------------------------------------
+ * doGet - Lectura de tarjetas
+ * ---------------------------------------------------------- */
+function doGet(e) {
+  try {
+    const action = e.parameter.action;
+
+    if (action === "getCards") {
+      const sheet = getSheet_();
+      const data = sheet.getDataRange().getValues();
+      const cards = data.slice(1)
+        .filter(row => row[0] !== "")
+        .map(rowToCard_);
+      return ok_(cards);
+    }
+
+    return fail_("Acción GET no reconocida");
+  } catch (err) {
+    return fail_(err.message);
+  }
+}
+
+/* ------------------------------------------------------------
+ * doPost - Creación, actualización, cambio de estado y borrado
+ * ---------------------------------------------------------- */
+function doPost(e) {
+  try {
+    const body = JSON.parse(e.postData.contents);
+    const action = body.action;
+    const sheet = getSheet_();
+
+    switch (action) {
+      case "createCard":
+        return ok_(createCard_(sheet, body));
+      case "updateCard":
+        return ok_(updateCard_(sheet, body));
+      case "updateStatus":
+        return ok_(updateStatus_(sheet, body));
+      case "deleteCard":
+        deleteCard_(sheet, body.id);
+        return ok_({ id: body.id });
+      default:
+        return fail_("Acción POST no reconocida: " + action);
+    }
+  } catch (err) {
+    return fail_(err.message);
+  }
+}
+
+/* ------------------------------------------------------------
+ * Operaciones CRUD
+ * ---------------------------------------------------------- */
+function createCard_(sheet, body) {
+  const id = Utilities.getUuid();
+  const now = new Date();
+
+  sheet.appendRow([
+    id,
+    body.titulo || "",
+    body.descripcion || "",
+    body.responsable || "Sin asignar",
+    body.fechaInicio || "",
+    body.fechaFin || "",
+    body.url || "",
+    body.estado || "Backlog",
+    now,
+  ]);
+
+  // Si la tarjeta se crea directamente en "En revisión", también se notifica
+  if ((body.estado || "Backlog") === STATUS_REVIEW) {
+    notifySprintMaster_(id, body.titulo, body.responsable);
+  }
+
+  const rowIndex = findRowIndexById_(sheet, id);
+  const row = sheet.getRange(rowIndex, 1, 1, HEADERS.length).getValues()[0];
+  return rowToCard_(row);
+}
+
+function updateCard_(sheet, body) {
+  const rowIndex = findRowIndexById_(sheet, body.id);
+  if (rowIndex === -1) throw new Error("Tarjeta no encontrada");
+
+  const previousEstado = sheet.getRange(rowIndex, 8).getValue();
+
+  sheet.getRange(rowIndex, 2, 1, 6).setValues([[
+    body.titulo || "",
+    body.descripcion || "",
+    body.responsable || "Sin asignar",
+    body.fechaInicio || "",
+    body.fechaFin || "",
+    body.url || "",
+  ]]);
+
+  if (body.estado) {
+    sheet.getRange(rowIndex, 8).setValue(body.estado);
+  }
+
+  const newEstado = body.estado || previousEstado;
+  if (newEstado === STATUS_REVIEW && previousEstado !== STATUS_REVIEW) {
+    notifySprintMaster_(body.id, body.titulo, body.responsable);
+  }
+
+  const row = sheet.getRange(rowIndex, 1, 1, HEADERS.length).getValues()[0];
+  return rowToCard_(row);
+}
+
+function updateStatus_(sheet, body) {
+  const rowIndex = findRowIndexById_(sheet, body.id);
+  if (rowIndex === -1) throw new Error("Tarjeta no encontrada");
+
+  const previousEstado = sheet.getRange(rowIndex, 8).getValue();
+  sheet.getRange(rowIndex, 8).setValue(body.estado);
+
+  // Disparo del correo SOLO cuando el nuevo estado es "En revisión"
+  // y antes no lo estaba (evita reenvíos si se guarda dos veces seguidas).
+  if (body.estado === STATUS_REVIEW && previousEstado !== STATUS_REVIEW) {
+    const row = sheet.getRange(rowIndex, 1, 1, HEADERS.length).getValues()[0];
+    const card = rowToCard_(row);
+    notifySprintMaster_(card.id, card.titulo, card.responsable);
+  }
+
+  const row = sheet.getRange(rowIndex, 1, 1, HEADERS.length).getValues()[0];
+  return rowToCard_(row);
+}
+
+function deleteCard_(sheet, id) {
+  const rowIndex = findRowIndexById_(sheet, id);
+  if (rowIndex === -1) throw new Error("Tarjeta no encontrada");
+  sheet.deleteRow(rowIndex);
+}
+
+/* ------------------------------------------------------------
+ * Notificación por correo al Sprint Master
+ * ---------------------------------------------------------- */
+function notifySprintMaster_(id, titulo, responsable) {
+  const email = PropertiesService.getScriptProperties().getProperty("SPRINT_MASTER_EMAIL");
+  if (!email) {
+    console.log("SPRINT_MASTER_EMAIL no configurado. Se omite el envío de correo.");
+    return;
+  }
+
+  const subject = `📋 Tarjeta lista para revisión: ${titulo}`;
+  const body =
+    `Hola,\n\n` +
+    `La siguiente tarjeta del tablero Kanban ha sido movida a "En revisión" y está lista para tu validación:\n\n` +
+    `• Tarjeta: ${titulo}\n` +
+    `• Responsable: ${responsable || "Sin asignar"}\n` +
+    `• ID: ${id}\n\n` +
+    `Por favor valida el entregable antes de moverla a "Finalizado".\n\n` +
+    `— Notificación automática del sistema Kanban`;
+
+  MailApp.sendEmail(email, subject, body);
+}
+
+/* ------------------------------------------------------------
+ * Función auxiliar para configurar el correo del Sprint Master
+ * manualmente desde el editor de Apps Script (ejecutar una vez).
+ * ---------------------------------------------------------- */
+function setSprintMasterEmail() {
+  PropertiesService.getScriptProperties().setProperty(
+    "SPRINT_MASTER_EMAIL",
+    "sprintmaster@tudominio.com" // <-- cambia este correo
+  );
+}
